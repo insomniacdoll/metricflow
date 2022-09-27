@@ -18,6 +18,7 @@ class SupportedSqlEngine(Enum):
     REDSHIFT = "Redshift"
     POSTGRES = "Postgres"
     SNOWFLAKE = "Snowflake"
+    MAXCOMPUTE = "MaxCompute"
 
 
 class SqlClient(Protocol):
