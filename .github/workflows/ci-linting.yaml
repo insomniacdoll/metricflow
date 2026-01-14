@@ -18,22 +18,20 @@ jobs:
     name: Run Pre-Commit Linting Hooks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python 3.8
-        uses: actions/setup-python@v2
-        with:
-          python-version: "3.8"
 
-      - uses: actions/cache@v2
-        with:
-          # cache the python dependencies and precommit-created virtual envs
-          path: |
-            ${{ env.pythonLocation }}
-            ~/.cache
-          key: ${{ env.pythonLocation }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Check-out the repo
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
 
-      - name: Install deps
-        run: pip install pre-commit
+      - uses: ./.github/actions/setup-python-env
+        with:
+          hatch-environment-cache-config-json: >-
+            {
+              "configs": [
+                {"hatch_project_directory": ".", "hatch_environment_name": "dev-env"}
+              ]
+            }
+          cache-pre-commit-environment: true
 
       - name: Run Linter
-        run: pre-commit run --show-diff-on-failure --color=always --all-files
+        run: >
+           make lint ADDITIONAL_PRECOMMIT_OPTIONS='--show-diff-on-failure'

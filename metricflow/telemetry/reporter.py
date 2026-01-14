@@ -1,32 +1,32 @@
+from __future__ import annotations
+
 import datetime
 import functools
 import logging
-import platform
 import os
+import platform
 import sys
 import time
 import traceback
 import uuid
 from hashlib import sha256
-from typing import Callable, Optional, Any
-from typing import List
+from typing import Callable, List, Optional, TypeVar
 
-from metricflow.configuration.config_handler import ConfigHandler
-from metricflow.configuration.constants import CONFIG_EMAIL
-from metricflow.object_utils import random_id
+from metricflow_semantics.toolkit.random_id import mf_random_id
+from typing_extensions import ParamSpec
+
 from metricflow.telemetry.handlers.handlers import (
-    ToMemoryTelemetryHandler,
     TelemetryHandler,
-    RudderstackTelemetryHandler,
+    ToMemoryTelemetryHandler,
 )
 from metricflow.telemetry.handlers.python_log import PythonLoggerTelemetryHandler
-from metricflow.telemetry.models import TelemetryLevel, FunctionStartEvent, FunctionEndEvent
+from metricflow.telemetry.models import FunctionEndEvent, FunctionStartEvent, TelemetryLevel
 
 logger = logging.getLogger(__name__)
 
 
 class TelemetryReporter:
-    """Reports telemetry for improving product experience"""
+    """Reports telemetry for improving product experience."""
 
     # Session ID to use when requesting a non-uniquely identifiable ID.
     FULLY_ANONYMOUS_CLIENT_ID = "anonymous"
@@ -36,7 +36,7 @@ class TelemetryReporter:
         """If fully_anonymous is set, use a client_id that is not unique."""
         self._report_levels_higher_or_equal_to = report_levels_higher_or_equal_to
         self._fully_anonymous = fully_anonymous
-        self._email = os.getenv(TelemetryReporter.ENV_EMAIL_OVERRIDE) or ConfigHandler().get_value(CONFIG_EMAIL)
+        self._email = os.getenv(TelemetryReporter.ENV_EMAIL_OVERRIDE)
 
         if fully_anonymous:
             self._client_id = TelemetryReporter.FULLY_ANONYMOUS_CLIENT_ID
@@ -61,14 +61,11 @@ class TelemetryReporter:
         id_str = "_".join([sys.platform, platform.release(), str(uuid.getnode())])
         return sha256(id_str.encode("utf-8")).hexdigest()
 
-    def add_python_log_handler(self) -> None:  # noqa: D
-        self._handlers.append(PythonLoggerTelemetryHandler(logger_level=logging.INFO))
-
-    def add_rudderstack_handler(self) -> None:  # noqa: D
-        self._handlers.append(RudderstackTelemetryHandler())
+    def add_python_log_handler(self) -> None:  # noqa: D102
+        self._handlers.append(PythonLoggerTelemetryHandler(logger_level=logging.DEBUG))
 
     def add_test_handler(self) -> None:
-        """See test_handler"""
+        """See test_handler."""
         self._handlers.append(self._test_handler)
 
     @property
@@ -76,7 +73,7 @@ class TelemetryReporter:
         """Used for testing only to verify that the handlers are getting the right events."""
         return self._test_handler
 
-    def log_function_start(  # noqa: D
+    def log_function_start(
         self,
         invocation_id: str,
         module_name: str,
@@ -99,7 +96,7 @@ class TelemetryReporter:
                     ),
                 )
 
-    def log_function_end(  # noqa: D
+    def log_function_end(
         self, invocation_id: str, module_name: str, function_name: str, runtime: float, exception_trace: Optional[str]
     ) -> None:
         """Similar to log_function_end, except adding the duration of the call and exception trace on error."""
@@ -121,7 +118,11 @@ class TelemetryReporter:
                 )
 
 
-def log_call(telemetry_reporter: TelemetryReporter, module_name: str) -> Callable[..., Any]:  # type: ignore[misc]
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def log_call(telemetry_reporter: TelemetryReporter, module_name: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to make it easier to log telemetry for function calls.
 
     Using module_name instead of introspection since it seems more robust.
@@ -134,13 +135,13 @@ def log_call(telemetry_reporter: TelemetryReporter, module_name: str) -> Callabl
 
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(func)
-        def wrapped(*args, **kwargs) -> Callable:  # type: ignore
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
             # Not every Callable has a __name__
             function_name = getattr(func, "__name__", repr(func))
-            invocation_id = f"call_{random_id()}"
-            start_time = time.time()
+            invocation_id = f"call_{mf_random_id()}"
+            start_time = time.perf_counter()
             telemetry_reporter.log_function_start(
                 invocation_id=invocation_id, module_name=module_name, function_name=function_name
             )
@@ -155,7 +156,7 @@ def log_call(telemetry_reporter: TelemetryReporter, module_name: str) -> Callabl
                     invocation_id=invocation_id,
                     module_name=module_name,
                     function_name=function_name,
-                    runtime=time.time() - start_time,
+                    runtime=time.perf_counter() - start_time,
                     exception_trace=exception_trace,
                 )
 

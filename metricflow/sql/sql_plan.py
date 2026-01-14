@@ -3,25 +3,30 @@
 from __future__ import annotations
 
 import logging
+import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
-from typing import Optional, List, Generic, Sequence, Tuple
+from typing import Generic, Optional, Sequence
 
-from metricflow.dag.mf_dag import DagNode, DisplayedProperty, MetricFlowDag, NodeId
-from metricflow.dag.id_generation import (
-    SQL_PLAN_SELECT_STATEMENT_ID_PREFIX,
-    SQL_PLAN_TABLE_FROM_CLAUSE_ID_PREFIX,
-)
-from metricflow.dataflow.sql_table import SqlTable
-from metricflow.sql.sql_exprs import SqlExpressionNode
-from metricflow.visitor import VisitorOutputT
+from metricflow_semantics.dag.id_prefix import StaticIdPrefix
+from metricflow_semantics.dag.mf_dag import DagId, DagNode, MetricFlowDag
+from metricflow_semantics.sql.sql_exprs import SqlColumnReferenceExpression, SqlExpressionNode
+from metricflow_semantics.toolkit.visitor import VisitorOutputT
+from typing_extensions import Self
+
+if typing.TYPE_CHECKING:
+    from metricflow.sql.sql_ctas_node import SqlCreateTableAsNode
+    from metricflow.sql.sql_cte_node import SqlCteAliasMapping, SqlCteNode
+    from metricflow.sql.sql_select_node import SqlSelectStatementNode
+    from metricflow.sql.sql_select_text_node import SqlSelectTextNode
+    from metricflow.sql.sql_table_node import SqlTableNode
 
 logger = logging.getLogger(__name__)
 
 
-class SqlQueryPlanNode(DagNode, ABC):
-    """Modeling a SQL query plan like a data flow plan as well.
+@dataclass(frozen=True, eq=False)
+class SqlPlanNode(DagNode["SqlPlanNode"], ABC):
+    """A node in the SQL plan model.
 
     In that model:
     * A source node that takes data into the graph e.g. SQL tables or SQL queries in a literal string format.
@@ -29,54 +34,76 @@ class SqlQueryPlanNode(DagNode, ABC):
     * Statements like ALTER TABLE don't fit well, but they could be modeled as just a single sink node.
     * SQL queries in where conditions could be modeled as another SqlQueryPlan.
     * SqlRenderableNode() indicates nodes where plan generation can begin. Generally, this will be all nodes except
-      the SqlTableFromClauseNode() since my_table.my_column wouldn't be a valid SQL query.
+      the SqlTableNode() since my_table.my_column wouldn't be a valid SQL query.
 
     Is there an existing library that can do this?
     """
 
-    def __init__(self, node_id: NodeId, parent_nodes: Sequence[SqlQueryPlanNode]) -> None:  # noqa: D:
-        self._parent_nodes = parent_nodes
-        super().__init__(node_id=node_id)
-
-    @property
-    def parent_nodes(self) -> List[SqlQueryPlanNode]:  # noqa: D
-        return list(self._parent_nodes)
-
     @abstractmethod
-    def accept(self, visitor: SqlQueryPlanNodeVisitor[VisitorOutputT]) -> VisitorOutputT:
+    def accept(self, visitor: SqlPlanNodeVisitor[VisitorOutputT]) -> VisitorOutputT:
         """Called when a visitor needs to visit this node."""
-        pass
-
-    @property
-    @abstractmethod
-    def is_table(self) -> bool:
-        """Returns whether this node resolves to a table (vs. a query)"""
-        pass
+        raise NotImplementedError
 
     @property
     @abstractmethod
     def as_select_node(self) -> Optional[SqlSelectStatementNode]:
         """If possible, return this as a select statement node."""
-        pass
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def as_sql_table_node(self) -> Optional[SqlTableNode]:
+        """If possible, return this as SQL table node."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def nearest_select_columns(self, cte_source_mapping: SqlCteAliasMapping) -> Optional[Sequence[SqlSelectColumn]]:
+        """Return the SELECT columns that are in this node or the closest `SqlSelectStatementNode` of its ancestors.
+
+        * For a SELECT statement node, this is just the columns in the node.
+        * For a node that has a SELECT statement node as its only parent (e.g. CREATE TABLE ... AS SELECT ...), this
+          would be the SELECT columns in the parent.
+        * If not known (e.g. an arbitrary SQL statement as a string), return None.
+        * This is used to figure out which columns are needed at a leaf node of the DAG for column pruning.
+        * A SQL table could refer to a CTE, so a mapping from the name of the CTE to the CTE node should be provided to
+          get the associated SELECT columns.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def copy(self) -> Self:
+        """Return a copy of the branch represented by this node.
+
+        The node fields are copied by reference, similar to shallow copying.
+        """
+        raise NotImplementedError
 
 
-class SqlQueryPlanNodeVisitor(Generic[VisitorOutputT], ABC):
-    """An object that can be used to visit the nodes of an SQL query.
+class SqlPlanNodeVisitor(Generic[VisitorOutputT], ABC):
+    """An object that can be used to visit the nodes of an SQL plan.
 
     See similar visitor DataflowPlanVisitor.
     """
 
     @abstractmethod
-    def visit_select_statement_node(self, node: SqlSelectStatementNode) -> VisitorOutputT:  # noqa: D
-        pass
+    def visit_select_statement_node(self, node: SqlSelectStatementNode) -> VisitorOutputT:  # noqa: D102
+        raise NotImplementedError
 
     @abstractmethod
-    def visit_table_from_clause_node(self, node: SqlTableFromClauseNode) -> VisitorOutputT:  # noqa: D
-        pass
+    def visit_table_node(self, node: SqlTableNode) -> VisitorOutputT:  # noqa: D102
+        raise NotImplementedError
 
     @abstractmethod
-    def visit_query_from_clause_node(self, node: SqlSelectQueryFromClauseNode) -> VisitorOutputT:  # noqa: D
-        pass
+    def visit_query_from_clause_node(self, node: SqlSelectTextNode) -> VisitorOutputT:  # noqa: D102
+        raise NotImplementedError
+
+    @abstractmethod
+    def visit_create_table_as_node(self, node: SqlCreateTableAsNode) -> VisitorOutputT:  # noqa: D102
+        raise NotImplementedError
+
+    @abstractmethod
+    def visit_cte_node(self, node: SqlCteNode) -> VisitorOutputT:  # noqa: D102
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -87,218 +114,44 @@ class SqlSelectColumn:
     # Always require a column alias for simplicity.
     column_alias: str
 
-
-class SqlJoinType(Enum):
-    """Enumerates the different kinds of SQL joins.
-
-    The value is the SQL string to be used when rendering the join.
-    """
-
-    LEFT_OUTER = "LEFT OUTER JOIN"
-    FULL_OUTER = "FULL OUTER JOIN"
-    INNER = "INNER JOIN"
-
-    def __repr__(self) -> str:  # noqa: D
-        return f"{self.__class__.__name__}.{self.name}"
-
-
-@dataclass(frozen=True)
-class SqlJoinDescription:
-    """Describes how sources should be joined together."""
-
-    # The source that goes on the right side of the JOIN keyword.
-    right_source: SqlQueryPlanNode
-    right_source_alias: str
-    on_condition: SqlExpressionNode
-    join_type: SqlJoinType
-
-
-@dataclass(frozen=True)
-class SqlOrderByDescription:  # noqa: D
-    expr: SqlExpressionNode
-    desc: bool
-
-
-class SqlSelectStatementNode(SqlQueryPlanNode):
-    """Represents an SQL Select statement."""
-
-    def __init__(  # noqa: D
-        self,
-        description: str,
-        select_columns: Tuple[SqlSelectColumn, ...],
-        from_source: SqlQueryPlanNode,
-        from_source_alias: str,
-        joins_descs: Tuple[SqlJoinDescription, ...],
-        group_bys: Tuple[SqlSelectColumn, ...],
-        order_bys: Tuple[SqlOrderByDescription, ...],
-        where: Optional[SqlExpressionNode] = None,
-        limit: Optional[int] = None,
-    ) -> None:
-        self._description = description
-        assert select_columns
-        self._select_columns = select_columns
-        # Sources that belong in a from clause. CTEs could be captured in a separate field.
-        self._from_source = from_source
-        self._from_source_alias = from_source_alias
-        self._join_descs = joins_descs
-        self._group_bys = group_bys
-        self._where = where
-        self._order_bys = order_bys
-
-        if limit is not None:
-            assert limit >= 0
-        self._limit = limit
-
-        super().__init__(
-            node_id=self.create_unique_id(),
-            parent_nodes=[self._from_source] + [x.right_source for x in self._join_descs],
+    @staticmethod
+    def from_column_reference(table_alias: str, column_name: str) -> SqlSelectColumn:
+        """Create a column that selects a column from a table by name."""
+        return SqlSelectColumn(
+            expr=SqlColumnReferenceExpression.from_column_reference(column_name=column_name, table_alias=table_alias),
+            column_alias=column_name,
         )
 
-    @classmethod
-    def id_prefix(cls) -> str:  # noqa: D
-        return SQL_PLAN_SELECT_STATEMENT_ID_PREFIX
+    def reference_from(self, source_table_alias: str) -> SqlColumnReferenceExpression:
+        """Return a column reference expression for this column with a new table alias.
 
-    @property
-    def description(self) -> str:  # noqa: D
-        return self._description
-
-    @property
-    def displayed_properties(self) -> List[DisplayedProperty]:  # noqa: D
-        return (
-            super().displayed_properties
-            + [DisplayedProperty(f"col{i}", column) for i, column in enumerate(self._select_columns)]
-            + [DisplayedProperty("from_source", self.from_source)]
-            + [DisplayedProperty(f"join_{i}", join_desc) for i, join_desc in enumerate(self._join_descs)]
-            + [DisplayedProperty(f"group_by{i}", group_by) for i, group_by in enumerate(self._group_bys)]
-            + [DisplayedProperty("where", self._where)]
-            + [DisplayedProperty(f"order_by{i}", order_by) for i, order_by in enumerate(self._order_bys)]
+        Useful when you already have access to the select column from a subquery and want to reference it in an outer query.
+        """
+        return SqlColumnReferenceExpression.from_column_reference(
+            column_name=self.column_alias, table_alias=source_table_alias
         )
 
-    @property
-    def select_columns(self) -> Tuple[SqlSelectColumn, ...]:  # noqa: D
-        return self._select_columns
-
-    @property
-    def from_source(self) -> SqlQueryPlanNode:  # noqa: D
-        return self._from_source
-
-    @property
-    def from_source_alias(self) -> str:  # noqa: D
-        return self._from_source_alias
-
-    @property
-    def join_descs(self) -> Tuple[SqlJoinDescription, ...]:  # noqa: D
-        return self._join_descs
-
-    @property
-    def group_bys(self) -> Tuple[SqlSelectColumn, ...]:  # noqa: D
-        return self._group_bys
-
-    @property
-    def where(self) -> Optional[SqlExpressionNode]:  # noqa: D
-        return self._where
-
-    @property
-    def order_bys(self) -> Tuple[SqlOrderByDescription, ...]:  # noqa: D
-        return self._order_bys
-
-    def accept(self, visitor: SqlQueryPlanNodeVisitor) -> VisitorOutputT:  # noqa: D
-        return visitor.visit_select_statement_node(self)
-
-    @property
-    def is_table(self) -> bool:  # noqa: D
-        return False
-
-    @property
-    def limit(self) -> Optional[int]:  # noqa: D
-        return self._limit
-
-    @property
-    def as_select_node(self) -> Optional[SqlSelectStatementNode]:  # noqa: D
-        return self
+    def copy_with_new_alias(self, column_alias: str) -> SqlSelectColumn:
+        """Return a copy with the `column_alias` replaced with the given value."""
+        return SqlSelectColumn(expr=self.expr, column_alias=column_alias)
 
 
-class SqlTableFromClauseNode(SqlQueryPlanNode):
-    """An SQL table that can go in the FROM clause."""
+class SqlPlan(MetricFlowDag[SqlPlanNode]):
+    """Model for an SQL statement as a DAG."""
 
-    def __init__(self, sql_table: SqlTable) -> None:  # noqa: D
-        self._sql_table = sql_table
-        super().__init__(node_id=self.create_unique_id(), parent_nodes=[])
-
-    @classmethod
-    def id_prefix(cls) -> str:  # noqa: D
-        return SQL_PLAN_TABLE_FROM_CLAUSE_ID_PREFIX
-
-    @property
-    def description(self) -> str:  # noqa: D
-        return f"Read from {self._sql_table.sql}"
-
-    @property
-    def displayed_properties(self) -> List[DisplayedProperty]:  # noqa: D
-        return super().displayed_properties + [
-            DisplayedProperty("table_id", self._sql_table.sql),
-        ]
-
-    def accept(self, visitor: SqlQueryPlanNodeVisitor[VisitorOutputT]) -> VisitorOutputT:  # noqa: D
-        return visitor.visit_table_from_clause_node(self)
-
-    @property
-    def sql_table(self) -> SqlTable:  # noqa: D
-        return self._sql_table
-
-    @property
-    def is_table(self) -> bool:  # noqa: D
-        return True
-
-    @property
-    def as_select_node(self) -> Optional[SqlSelectStatementNode]:  # noqa: D
-        return None
-
-
-class SqlSelectQueryFromClauseNode(SqlQueryPlanNode):
-    """An SQL select query that can go in the FROM clause."""
-
-    def __init__(self, select_query: str) -> None:  # noqa: D
-        self._select_query = select_query
-        super().__init__(node_id=self.create_unique_id(), parent_nodes=[])
-
-    @classmethod
-    def id_prefix(cls) -> str:  # noqa: D
-        return SQL_PLAN_TABLE_FROM_CLAUSE_ID_PREFIX
-
-    @property
-    def description(self) -> str:  # noqa: D
-        return "Read From a Select Query"
-
-    def accept(self, visitor: SqlQueryPlanNodeVisitor[VisitorOutputT]) -> VisitorOutputT:  # noqa: D
-        return visitor.visit_query_from_clause_node(self)
-
-    @property
-    def select_query(self) -> str:  # noqa: D
-        return self._select_query
-
-    @property
-    def is_table(self) -> bool:  # noqa: D
-        return False
-
-    @property
-    def as_select_node(self) -> Optional[SqlSelectStatementNode]:  # noqa: D
-        return None
-
-
-class SqlQueryPlan(MetricFlowDag[SqlQueryPlanNode]):  # noqa: D
-    """Model for an SQL Query as a DAG."""
-
-    def __init__(self, plan_id: str, render_node: SqlQueryPlanNode) -> None:
-        """Constructor.
+    def __init__(self, render_node: SqlPlanNode, plan_id: Optional[DagId] = None) -> None:
+        """initializer.
 
         Args:
-            plan_id: The ID to associate with this plan.
-            render_node: The node from which to start rendering the SQL query.
+            render_node: The node from which to start rendering the SQL statement.
+            plan_id: If specified, use this sql_query_plan_id instead of a generated one.
         """
         self._render_node = render_node
-        super().__init__(dag_id=plan_id, sink_nodes=[self._render_node])
+        super().__init__(
+            dag_id=plan_id or DagId.from_id_prefix(StaticIdPrefix.SQL_PLAN_PREFIX),
+            sink_nodes=[self._render_node],
+        )
 
     @property
-    def render_node(self) -> SqlQueryPlanNode:  # noqa: D
+    def render_node(self) -> SqlPlanNode:  # noqa: D102
         return self._render_node

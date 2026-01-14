@@ -3,15 +3,15 @@ from __future__ import annotations
 import datetime
 from abc import ABC
 from enum import Enum, IntEnum
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
-from metricflow.model.objects.base import FrozenBaseModel
+from dbt_semantic_interfaces.implementations.base import FrozenBaseModel
 
 EVENT_SCHEMA = "v1.0"
 
 
 class TelemetryLevel(IntEnum):
-    """Determines the level of a telemetry event"""
+    """Determines the level of a telemetry event."""
 
     USAGE = 10
     ERROR = 20
@@ -45,7 +45,7 @@ class FunctionStartEvent(TelemetryEvent, FrozenBaseModel):
     function_name: str
 
     @staticmethod
-    def create(  # noqa: D
+    def create(  # noqa: D102
         event_time: datetime.datetime,
         level_name: str,
         invocation_id: str,
@@ -73,7 +73,7 @@ class FunctionEndEvent(TelemetryEvent, FrozenBaseModel):
     exception_trace: Optional[str] = None
 
     @staticmethod
-    def create(  # noqa: D
+    def create(  # noqa: D102
         event_time: datetime.datetime,
         level_name: str,
         invocation_id: str,

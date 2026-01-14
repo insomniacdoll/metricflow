@@ -2,28 +2,32 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Sequence
+from typing import List, Optional, Sequence, Tuple
 
-from metricflow.sql.optimizer.sql_query_plan_optimizer import SqlQueryPlanOptimizer
-from metricflow.sql.sql_exprs import (
+from metricflow_semantics.sql.sql_exprs import (
+    SqlColumnAliasReferenceExpression,
     SqlColumnReference,
-    SqlExpressionTreeLineage,
-    SqlExpressionNode,
     SqlColumnReplacements,
+    SqlExpressionNode,
+    SqlExpressionTreeLineage,
     SqlLogicalExpression,
     SqlLogicalOperator,
-    SqlColumnAliasReferenceExpression,
 )
+from metricflow_semantics.toolkit.mf_logging.lazy_formattable import LazyFormat
+from metricflow_semantics.toolkit.string_helpers import mf_indent
+from typing_extensions import override
+
+from metricflow.sql.optimizer.sql_query_plan_optimizer import SqlPlanOptimizer
+from metricflow.sql.sql_ctas_node import SqlCreateTableAsNode
+from metricflow.sql.sql_cte_node import SqlCteNode
 from metricflow.sql.sql_plan import (
-    SqlQueryPlanNode,
-    SqlQueryPlanNodeVisitor,
-    SqlSelectQueryFromClauseNode,
-    SqlTableFromClauseNode,
-    SqlSelectStatementNode,
-    SqlOrderByDescription,
-    SqlJoinDescription,
+    SqlPlanNode,
+    SqlPlanNodeVisitor,
     SqlSelectColumn,
 )
+from metricflow.sql.sql_select_node import SqlJoinDescription, SqlOrderByDescription, SqlSelectStatementNode
+from metricflow.sql.sql_select_text_node import SqlSelectTextNode
+from metricflow.sql.sql_table_node import SqlTableNode
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +66,7 @@ class RewritableSqlClauses:
         if len(all_where_clauses) == 1:
             return all_where_clauses[0]
         elif len(all_where_clauses) > 1:
-            return SqlLogicalExpression(
+            return SqlLogicalExpression.create(
                 operator=SqlLogicalOperator.AND,
                 args=tuple(all_where_clauses),
             )
@@ -70,7 +74,7 @@ class RewritableSqlClauses:
 
     @property
     def contains_ambiguous_exprs(self) -> bool:
-        """Returns true if any of the clauses have ambiguous expressions that will be difficult to re-write"""
+        """Returns true if any of the clauses have ambiguous expressions that will be difficult to re-write."""
         return any(
             [x.expr.lineage.contains_ambiguous_exprs for x in self.select_columns]
             + [x.lineage.contains_ambiguous_exprs for x in self.wheres]
@@ -79,7 +83,7 @@ class RewritableSqlClauses:
         )
 
 
-class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNode]):
+class SqlRewritingSubQueryReducerVisitor(SqlPlanNodeVisitor[SqlPlanNode]):
     """Visits the SQL query plan to simplify sub-queries. On each visit, return a simplified node.
 
     Unlike SqlSubQueryReducerVisitor, this will re-write expressions to realize more reductions.
@@ -90,29 +94,33 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         node: SqlSelectStatementNode,
     ) -> SqlSelectStatementNode:
         """Apply the reducing operation to the parent select statements."""
-        return SqlSelectStatementNode(
+        return SqlSelectStatementNode.create(
             description=node.description,
             select_columns=node.select_columns,
             from_source=node.from_source.accept(self),
             from_source_alias=node.from_source_alias,
-            joins_descs=tuple(
+            cte_sources=tuple(
+                cte_source.with_new_select(cte_source.select_statement.accept(self)) for cte_source in node.cte_sources
+            ),
+            join_descs=tuple(
                 SqlJoinDescription(
-                    right_source=x.right_source.accept(self),
-                    right_source_alias=x.right_source_alias,
-                    on_condition=x.on_condition,
-                    join_type=x.join_type,
+                    right_source=join_desc.right_source.accept(self),
+                    right_source_alias=join_desc.right_source_alias,
+                    on_condition=join_desc.on_condition,
+                    join_type=join_desc.join_type,
                 )
-                for x in node.join_descs
+                for join_desc in node.join_descs
             ),
             group_bys=node.group_bys,
             order_bys=node.order_bys,
             where=node.where,
             limit=node.limit,
+            distinct=node.distinct,
         )
 
     @staticmethod
     def _statement_contains_difficult_expressions(node: SqlSelectStatementNode) -> bool:
-        combined_lineage = SqlExpressionTreeLineage.combine(
+        combined_lineage = SqlExpressionTreeLineage.merge_iterable(
             tuple(x.expr.lineage for x in node.select_columns)
             + ((node.where.lineage,) if node.where else ())
             + tuple(x.expr.lineage for x in node.group_bys)
@@ -123,7 +131,7 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
 
     @staticmethod
     def _select_columns_contain_string_expressions(select_columns: Tuple[SqlSelectColumn, ...]) -> bool:
-        combined_lineage = SqlExpressionTreeLineage.combine(tuple(x.expr.lineage for x in select_columns))
+        combined_lineage = SqlExpressionTreeLineage.merge_iterable(tuple(x.expr.lineage for x in select_columns))
 
         return len(combined_lineage.string_exprs) > 0
 
@@ -135,19 +143,24 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         return True
 
     @staticmethod
+    def _select_columns_with_window_functions(select_columns: Tuple[SqlSelectColumn, ...]) -> List[SqlSelectColumn]:
+        return [select_column for select_column in select_columns if select_column.expr.as_window_function_expression]
+
+    @staticmethod
     def _select_column_for_alias(column_alias: str, select_columns: Sequence[SqlSelectColumn]) -> SqlSelectColumn:
         for select_column in select_columns:
             if select_column.column_alias == column_alias:
                 return select_column
-        raise RuntimeError(f"Column alias '{column_alias}' not in SELECT columns: {select_columns}")
+        raise RuntimeError(f"Column alias {repr(column_alias)} not in SELECT columns: {select_columns}")
 
     @staticmethod
     def _is_simple_source(node: SqlSelectStatementNode) -> bool:
         """Returns true if the node is simple.
 
-        Simple is defined as having no JOINs, WHERE, GROUP BYs, ORDER BYs, LIMIT and there are no strings in the column
+        Simple is defined as having no JOINs, WHERE, GROUP BYs, ORDER BYs, LIMIT, AGG functions, and there are no strings in the column
         select. Strings are avoided so that the child node doesn't use the string expression in a group by or cause
-        aliasing issues when used in the child query.
+        aliasing issues when used in the child query. Aggregate functions are avoided due to the nature of applying on grouped rows which
+        is essentially the effect as group bys and should be treated in here as such.
 
         e.g.
 
@@ -181,35 +194,39 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
                 return False
             if select_column.expr.lineage.contains_column_alias_exprs:
                 return False
+            if select_column.expr.lineage.contains_aggregate_exprs:
+                return False
         return (
-            len(node.parent_nodes) <= 1
+            len(node.join_descs) == 0
             and len(node.group_bys) == 0
             and len(node.order_bys) == 0
             and not node.limit
             and not node.where
         )
 
-    def _current_node_can_be_reduced(self, node: SqlSelectStatementNode) -> bool:  # noqa: D
+    def _current_node_can_be_reduced(self, node: SqlSelectStatementNode) -> bool:
         """Returns true if the given node can be reduced with the parent node.
 
         Reducing this node means eliminating the SELECT of this node and merging it with the parent SELECT. This
         checks for the cases where we are able to reduce.
         """
-
-        # If this node has multiple parents (i.e. a join) that are complex, then this can't be collapsed.
-        is_join = len(node.join_descs) > 0
-        has_multiple_parent_nodes = len(node.parent_nodes) > 1
-        if has_multiple_parent_nodes or is_join:
+        # If this node has joins, then don't collapse this as it can be complex.
+        if len(node.join_descs) > 0:
             return False
 
-        assert len(node.parent_nodes) == 1
-        parent_node = node.parent_nodes[0]
+        # If the parent node defines CTEs, don't reduce for simplicity. It's possible to improve this by keeping track
+        # of the CTE-alias mapping as the SQL plan is traversed and then allowing for reduction if there are no
+        # alias collisions (e.g. with other CTEs or the alias in the FROM clause).
+        from_clause_node = node.from_source.as_select_node
+        if from_clause_node is not None:
+            if len(from_clause_node.cte_sources) > 0:
+                return False
 
         # If the parent node is not a SELECT statement, then this can't be collapsed. e.g. with a table as a parent like
         # SELECT foo FROM bar
-        if not parent_node.as_select_node:
+        from_source_node_as_select_node = node.from_source.as_select_node
+        if from_source_node_as_select_node is None:
             return False
-        parent_select_node = parent_node.as_select_node
 
         # More conditions where we don't want to collapse. It's not impossible with these cases, but not reducing in
         # these cases for simplicity.
@@ -218,15 +235,26 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         if SqlRewritingSubQueryReducerVisitor._statement_contains_difficult_expressions(node):
             return False
 
-        # Skip this case for simplicity of reasoning.
-        if len(node.order_bys) > 0 and len(parent_select_node.order_bys) > 0:
+        # Don't reduce distinct selects
+        if from_source_node_as_select_node.distinct:
             return False
 
         # Skip this case for simplicity of reasoning.
-        if len(parent_select_node.group_bys) > 0 and len(node.group_bys) > 0:
+        if len(node.order_bys) > 0 and len(from_source_node_as_select_node.order_bys) > 0:
             return False
 
-        # TODO: Check for the following case:
+        # Skip this case for simplicity of reasoning.
+        if len(from_source_node_as_select_node.group_bys) > 0 and len(node.group_bys) > 0:
+            return False
+
+        # Skip this case for readability.
+        if any(col.expr.is_verbose for col in from_source_node_as_select_node.select_columns):
+            return False
+
+        # If there is a column in the parent group by that is not used in the current select statement, don't reduce or it
+        # would leave an unselected column in the group by and change the meaning of the query. For example, in the SQL
+        # below, reducing would remove the `is_instant` from the select statement.
+        #
         # SELECT
         #   bookings
         #   , 2 * bookings AS twice_bookings
@@ -234,36 +262,75 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         #   SELECT,
         #     SUM(bookings) AS bookings
         #     , fct_bookings_src.is_instant
-        #   FROM (
-        #     SELECT * FROM demo.fct_bookings
-        #   ) fct_bookings_src
+        #   FROM demo.fct_bookings fct_bookings_src
         #   GROUP BY fct_bookings_src.is_instant
         # ) src
         #
-        # If this is reduced, then the GROUP BY will refer to an unused column.
+        # Note: this is not as fine-tuned as it could be. This checks if all parent group bys are used in the current select
+        # columns as column reference expressions. If any are used in different types of expressions, we could reduce but
+        # won't. This is just limited by the complexity of different expressions that might be used.
+        current_select_column_refs = {
+            select_column.expr.as_column_reference_expression.col_ref.column_name
+            for select_column in node.select_columns
+            if select_column.expr.as_column_reference_expression
+        }
+        all_parent_group_bys_used_in_current_select = True
+        for group_by in from_source_node_as_select_node.group_bys:
+            parent_group_by_select = SqlGroupByRewritingVisitor._find_matching_select(
+                expr=group_by.expr, select_columns=from_source_node_as_select_node.select_columns
+            )
+            if parent_group_by_select and parent_group_by_select.column_alias not in current_select_column_refs:
+                all_parent_group_bys_used_in_current_select = False
+        if not all_parent_group_bys_used_in_current_select:
+            return False
 
-        # Don't reduce if the ORDER BYs aren't column reference expressions for simplicity.
-        for order_by in node.order_bys:
-            order_by_column_reference_expression = order_by.expr.as_column_reference_expression
-            if not order_by_column_reference_expression:
-                return False
-            # Also for simplicity, the ORDER BY must match one of the SELECT expressions.
-            if not SqlRewritingSubQueryReducerVisitor._find_matching_select_column(
-                col_ref=order_by_column_reference_expression.col_ref,
-                select_columns=node.select_columns,
-            ):
+        # Don't reduce if the ORDER BYs aren't column reference expressions or column alias reference expressions for simplicity.
+        # Also for simplicity, the ORDER BY must match one of the SELECT expressions.
+        for order_by in node.order_bys or from_source_node_as_select_node.order_bys:
+            try:
+                if not self._get_matching_column_for_order_by(
+                    order_by_expr=order_by.expr, select_columns=node.select_columns
+                ):
+                    return False
+            except RuntimeError:
                 return False
 
         # If the parent has a GROUP BY and this has a WHERE, avoid reducing as the WHERE could reference an
         # aggregation expression.
-        if len(parent_select_node.group_bys) > 0 and node.where:
+        if len(from_source_node_as_select_node.group_bys) > 0 and node.where:
             return False
 
         # If the parent has a GROUP BY, the case where it's easiest to merge this with the parent is if all select
         # columns are column references.
         if len(
-            parent_select_node.group_bys
+            from_source_node_as_select_node.group_bys
         ) > 0 and not SqlRewritingSubQueryReducerVisitor._select_columns_are_column_references(node.select_columns):
+            return False
+
+        # If the group by is referencing a window function in the parent node, it can't be reduced.
+        # Window functions can't be included in group by.
+        parent_column_aliases_with_window_functions = {
+            select_column.column_alias
+            for select_column in SqlRewritingSubQueryReducerVisitor._select_columns_with_window_functions(
+                from_source_node_as_select_node.select_columns
+            )
+        }
+        if len(node.group_bys) > 0 and [
+            group_by
+            for group_by in node.group_bys
+            if (
+                group_by.column_alias in parent_column_aliases_with_window_functions
+                or (
+                    group_by.expr.as_column_reference_expression
+                    and group_by.expr.as_column_reference_expression.col_ref.column_name
+                    in parent_column_aliases_with_window_functions
+                )
+                or (
+                    group_by.expr.as_string_expression
+                    and group_by.expr.as_string_expression.sql_expr in parent_column_aliases_with_window_functions
+                )
+            )
+        ]:
             return False
 
         # If the parent select node contains string columns, and this has a GROUP BY, don't reduce as string columns
@@ -292,7 +359,7 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         # item in the SELECT to group by.
 
         if len(node.group_bys) > 0 and SqlRewritingSubQueryReducerVisitor._select_columns_contain_string_expressions(
-            select_columns=parent_select_node.select_columns,
+            select_columns=from_source_node_as_select_node.select_columns,
         ):
             return False
 
@@ -344,7 +411,7 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         # For type checking. The above conditionals should ensure the below.
         assert node_where
         assert parent_node_where
-        return SqlLogicalExpression(operator=SqlLogicalOperator.AND, args=(node_where, parent_node_where))
+        return SqlLogicalExpression.create(operator=SqlLogicalOperator.AND, args=(node_where, parent_node_where))
 
     @staticmethod
     def _find_matching_select_column(
@@ -357,7 +424,19 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         return None
 
     @staticmethod
-    def _rewrite_node_with_join(node: SqlSelectStatementNode) -> SqlSelectStatementNode:
+    def _find_matching_select_column_from_alias_ref_expr(
+        col_alias_ref_expr: SqlColumnAliasReferenceExpression, select_columns: Sequence[SqlSelectColumn]
+    ) -> Optional[SqlSelectColumn]:
+        for select_column in select_columns:
+            column_reference_expression = select_column.expr.as_column_reference_expression
+            if (
+                column_reference_expression
+                and column_reference_expression.col_ref.column_name == col_alias_ref_expr.column_alias
+            ):
+                return select_column
+        return None
+
+    def _rewrite_node_with_join(self, node: SqlSelectStatementNode) -> SqlSelectStatementNode:
         """Reduces nodes with joins if the join source is simple to reduce.
 
         Converts this:
@@ -393,7 +472,6 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         ON bookings_src.listing_id = dim_listings_src.listing_id
         GROUP BY bookings_src.ds
         """
-
         # Check that there aren't any duplicates in source aliases, or else there would be a collision when reduced.
         # This check is conservative as it checks for duplicates in this node and parent nodes, but depending on
         # on which sources get reduced, there may not be a collision.
@@ -441,7 +519,11 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
             join_select_node = join_desc.right_source.as_select_node
 
             # Verifying that it's simple makes it easier to reason about the logic.
-            if not join_select_node or not SqlRewritingSubQueryReducerVisitor._is_simple_source(join_select_node):
+            if (
+                not join_select_node
+                or not SqlRewritingSubQueryReducerVisitor._is_simple_source(join_select_node)
+                or any(col.expr.is_verbose for col in join_select_node.select_columns)
+            ):
                 new_join_descs.append(join_desc)
                 continue
 
@@ -455,7 +537,9 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
                 SqlJoinDescription(
                     right_source=join_select_node.from_source,
                     right_source_alias=join_select_node.from_source_alias,
-                    on_condition=join_desc.on_condition.rewrite(column_replacements),
+                    on_condition=(
+                        join_desc.on_condition.rewrite(column_replacements) if join_desc.on_condition else None
+                    ),
                     join_type=join_desc.join_type,
                 )
             )
@@ -472,7 +556,9 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
                 SqlJoinDescription(
                     right_source=x.right_source,
                     right_source_alias=x.right_source_alias,
-                    on_condition=x.on_condition.rewrite(column_replacements=column_replacements),
+                    on_condition=(
+                        x.on_condition.rewrite(column_replacements=column_replacements) if x.on_condition else None
+                    ),
                     join_type=x.join_type,
                 )
                 for x in new_join_descs
@@ -492,7 +578,7 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
 
             clauses_to_rewrite.rewrite(column_replacements=column_replacements)
             # This was already checked in _is_simple_source().
-            assert len(from_source_select.parent_nodes) == 1
+            assert len(from_source_select.join_descs) == 0
             from_source = from_source_select.from_source
             from_source_alias = from_source_select.from_source_alias
 
@@ -500,29 +586,42 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
                 SqlJoinDescription(
                     right_source=x.right_source,
                     right_source_alias=x.right_source_alias,
-                    on_condition=x.on_condition.rewrite(column_replacements=column_replacements),
+                    on_condition=(
+                        x.on_condition.rewrite(column_replacements=column_replacements) if x.on_condition else None
+                    ),
                     join_type=x.join_type,
                 )
                 for x in new_join_descs
             ]
 
-        return SqlSelectStatementNode(
+        return SqlSelectStatementNode.create(
             description=node.description,
             select_columns=tuple(clauses_to_rewrite.select_columns),
             from_source=from_source,
             from_source_alias=from_source_alias,
-            joins_descs=tuple(new_join_descs),
+            cte_sources=tuple(
+                cte_source.with_new_select(cte_source.select_statement.accept(self)) for cte_source in node.cte_sources
+            ),
+            join_descs=tuple(new_join_descs),
             group_bys=tuple(clauses_to_rewrite.group_bys),
             order_bys=tuple(clauses_to_rewrite.order_bys),
             where=clauses_to_rewrite.combine_wheres(additional_where_clauses),
             limit=node.limit,
+            distinct=node.distinct,
         )
 
-    def visit_select_statement_node(self, node: SqlSelectStatementNode) -> SqlQueryPlanNode:  # noqa: D
+    @override
+    def visit_cte_node(self, node: SqlCteNode) -> SqlPlanNode:
+        return SqlCteNode.create(
+            select_statement=node.accept(self),
+            cte_alias=node.cte_alias,
+        )
+
+    def visit_select_statement_node(self, node: SqlSelectStatementNode) -> SqlPlanNode:  # noqa: D102
         node_with_reduced_parents = self._reduce_parents(node)
 
-        if len(node_with_reduced_parents.parent_nodes) > 1:
-            return SqlRewritingSubQueryReducerVisitor._rewrite_node_with_join(node_with_reduced_parents)
+        if len(node_with_reduced_parents.join_descs) > 0:
+            return self._rewrite_node_with_join(node_with_reduced_parents)
 
         if not self._current_node_can_be_reduced(node_with_reduced_parents):
             return node_with_reduced_parents
@@ -542,10 +641,11 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         # JOIN dim_listings c
         # ON a.listing_id = b.listing_id
 
-        assert len(node_with_reduced_parents.parent_nodes) == 1
-        parent_node = node_with_reduced_parents.parent_nodes[0]
-        parent_select_node = parent_node.as_select_node
-        assert parent_select_node
+        from_source_node = node_with_reduced_parents.from_source
+        from_source_select_node = from_source_node.as_select_node
+        assert (
+            from_source_select_node is not None
+        ), f"{from_source_select_node=} should be set as `_current_node_can_be_reduced()` returned True"
 
         # At this point, the query should look similar to
         #
@@ -558,10 +658,8 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         #     ORDER by b.baz
         #     LIMIT 1
 
-        # The ORDER BY in the parent doesn't matter since the order by in this node will "overwrite" the order in the
-        # parent as long as the parent has no limits.
         column_replacements = SqlRewritingSubQueryReducerVisitor._get_column_replacements(
-            parent_node=parent_select_node,
+            parent_node=from_source_select_node,
             parent_node_alias=node.from_source_alias,
         )
         new_order_bys: List[SqlOrderByDescription] = []
@@ -578,22 +676,18 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         #
         # SELECT SUM(b.bookings) AS bookings
         # FROM fct_bookings b
-        # ORDER BY SUM(b.bookings) -- Throws an error in some engines.
-        if node_with_reduced_parents.order_bys:
-            for order_by_item in node_with_reduced_parents.order_bys:
-                order_by_item_expr = order_by_item.expr.as_column_reference_expression
-                assert order_by_item_expr
+        # ORDER BY SUM(b.bookings) -- Throws an error in some engines. Instead, use the column alias.
 
-                matching_select_column = SqlRewritingSubQueryReducerVisitor._find_matching_select_column(
-                    col_ref=order_by_item_expr.col_ref,
-                    select_columns=node_with_reduced_parents.select_columns,
+        # We don't reduce if both this node and the parent have an ORDER BY, so here pick the order by from either.
+        order_bys_to_use = node_with_reduced_parents.order_bys or from_source_select_node.order_bys
+        if order_bys_to_use:
+            for order_by_item in order_bys_to_use:
+                matching_select_column = self._get_matching_column_for_order_by(
+                    order_by_expr=order_by_item.expr, select_columns=node_with_reduced_parents.select_columns
                 )
-                # This must be the case because of _should_reduce()
-                assert matching_select_column
-
                 new_order_bys.append(
                     SqlOrderByDescription(
-                        expr=SqlColumnAliasReferenceExpression(column_alias=matching_select_column.column_alias),
+                        expr=SqlColumnAliasReferenceExpression.create(column_alias=matching_select_column.column_alias),
                         desc=order_by_item.desc,
                     )
                 )
@@ -601,49 +695,86 @@ class SqlRewritingSubQueryReducerVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNod
         # The limit should be the min of this SELECT limit and the parent SELECT limit.
         new_limit: Optional[int] = node_with_reduced_parents.limit
         if new_limit is None:
-            new_limit = parent_select_node.limit
-        elif parent_select_node.limit is not None:
-            new_limit = min(new_limit, parent_select_node.limit)
+            new_limit = from_source_select_node.limit
+        elif from_source_select_node.limit is not None:
+            new_limit = min(new_limit, from_source_select_node.limit)
 
         new_group_bys: Tuple[SqlSelectColumn, ...] = ()
-        if node.group_bys and parent_select_node.group_bys:
+        if node.group_bys and from_source_select_node.group_bys:
             raise RuntimeError(
                 "Attempting to reduce sub-queries when this and the parent have GROUP BYs. This should have been "
-                "prevent by _should_reduce()"
+                "prevented by _current_node_can_be_reduced()"
             )
         elif node.group_bys:
             new_group_bys = SqlRewritingSubQueryReducerVisitor._rewrite_select_columns(
                 old_select_columns=node.group_bys, column_replacements=column_replacements
             )
-        elif parent_select_node.group_bys:
-            new_group_bys = parent_select_node.group_bys
+        elif from_source_select_node.group_bys:
+            new_group_bys = from_source_select_node.group_bys
 
-        return SqlSelectStatementNode(
-            description="\n".join([parent_select_node.description, node_with_reduced_parents.description]),
+        return SqlSelectStatementNode.create(
+            description="\n".join([from_source_select_node.description, node_with_reduced_parents.description]),
             select_columns=SqlRewritingSubQueryReducerVisitor._rewrite_select_columns(
                 old_select_columns=node.select_columns, column_replacements=column_replacements
             ),
-            from_source=parent_select_node.from_source,
-            from_source_alias=parent_select_node.from_source_alias,
-            joins_descs=parent_select_node.join_descs,
+            from_source=from_source_select_node.from_source,
+            from_source_alias=from_source_select_node.from_source_alias,
+            cte_sources=tuple(
+                cte_source.with_new_select(cte_source.select_statement.accept(self)) for cte_source in node.cte_sources
+            ),
+            join_descs=from_source_select_node.join_descs,
             group_bys=new_group_bys,
             order_bys=tuple(new_order_bys),
             where=SqlRewritingSubQueryReducerVisitor._rewrite_where(
                 column_replacements=column_replacements,
                 node_where=node.where,
-                parent_node_where=parent_select_node.where,
+                parent_node_where=from_source_select_node.where,
             ),
             limit=new_limit,
+            distinct=from_source_select_node.distinct,
         )
 
-    def visit_table_from_clause_node(self, node: SqlTableFromClauseNode) -> SqlQueryPlanNode:  # noqa: D
+    def _get_matching_column_for_order_by(
+        self, order_by_expr: SqlExpressionNode, select_columns: Sequence[SqlSelectColumn]
+    ) -> SqlSelectColumn:
+        order_by_col_ref_expr = order_by_expr.as_column_reference_expression
+        order_by_col_alias_ref_expr = order_by_expr.as_column_alias_reference_expression
+        if order_by_col_ref_expr:
+            matching_select_column = SqlRewritingSubQueryReducerVisitor._find_matching_select_column(
+                col_ref=order_by_col_ref_expr.col_ref, select_columns=select_columns
+            )
+        elif order_by_col_alias_ref_expr:
+            matching_select_column = (
+                SqlRewritingSubQueryReducerVisitor._find_matching_select_column_from_alias_ref_expr(
+                    col_alias_ref_expr=order_by_col_alias_ref_expr, select_columns=select_columns
+                )
+            )
+        else:
+            raise RuntimeError(
+                f"Expected a column reference expression or a column alias reference expression in ORDER BY but got: {order_by_expr}."
+                "This indicates internal misconfiguration."
+            )
+
+        if not matching_select_column:
+            raise RuntimeError(
+                "Did not find matching select column for order by. This indicates internal misconfiguration."
+            )
+        return matching_select_column
+
+    def visit_table_node(self, node: SqlTableNode) -> SqlPlanNode:  # noqa: D102
         return node
 
-    def visit_query_from_clause_node(self, node: SqlSelectQueryFromClauseNode) -> SqlQueryPlanNode:  # noqa: D
+    def visit_query_from_clause_node(self, node: SqlSelectTextNode) -> SqlPlanNode:  # noqa: D102
         return node
 
+    def visit_create_table_as_node(self, node: SqlCreateTableAsNode) -> SqlPlanNode:  # noqa: D102
+        return SqlCreateTableAsNode.create(
+            sql_table=node.sql_table,
+            parent_node=node.parent_node.accept(self),
+        )
 
-class SqlGroupByRewritingVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNode]):
+
+class SqlGroupByRewritingVisitor(SqlPlanNodeVisitor[SqlPlanNode]):
     """Re-writes the GROUP BY to use a SqlColumnAliasReferenceExpression."""
 
     @staticmethod
@@ -652,11 +783,15 @@ class SqlGroupByRewritingVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNode]):
     ) -> Optional[SqlSelectColumn]:
         """Given an expression, find the SELECT column that has the same expression."""
         for select_column in select_columns:
-            if select_column.expr == expr:
+            if select_column.expr.matches(expr):
                 return select_column
         return None
 
-    def visit_select_statement_node(self, node: SqlSelectStatementNode) -> SqlQueryPlanNode:  # noqa: D
+    @override
+    def visit_cte_node(self, node: SqlCteNode) -> SqlPlanNode:
+        return node.with_new_select(node.select_statement.accept(self))
+
+    def visit_select_statement_node(self, node: SqlSelectStatementNode) -> SqlPlanNode:  # noqa: D102
         new_group_bys = []
         for group_by in node.group_bys:
             matching_select_column = SqlGroupByRewritingVisitor._find_matching_select(
@@ -665,20 +800,27 @@ class SqlGroupByRewritingVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNode]):
             if matching_select_column:
                 new_group_bys.append(
                     SqlSelectColumn(
-                        expr=SqlColumnAliasReferenceExpression(column_alias=matching_select_column.column_alias),
+                        expr=SqlColumnAliasReferenceExpression.create(column_alias=matching_select_column.column_alias),
                         column_alias=matching_select_column.column_alias,
                     )
                 )
             else:
-                logger.error(f"Did not find matching select for {group_by} in {node}")
+                logger.debug(
+                    LazyFormat(
+                        lambda: f"Did not find matching select for {group_by} in:\n{mf_indent(node.structure_text())}"
+                    )
+                )
                 new_group_bys.append(group_by)
 
-        return SqlSelectStatementNode(
+        return SqlSelectStatementNode.create(
             description=node.description,
             select_columns=node.select_columns,
             from_source=node.from_source.accept(self),
             from_source_alias=node.from_source_alias,
-            joins_descs=tuple(
+            cte_sources=tuple(
+                cte_source.with_new_select(cte_source.select_statement.accept(self)) for cte_source in node.cte_sources
+            ),
+            join_descs=tuple(
                 SqlJoinDescription(
                     right_source=x.right_source.accept(self),
                     right_source_alias=x.right_source_alias,
@@ -691,16 +833,23 @@ class SqlGroupByRewritingVisitor(SqlQueryPlanNodeVisitor[SqlQueryPlanNode]):
             order_bys=node.order_bys,
             where=node.where,
             limit=node.limit,
+            distinct=node.distinct,
         )
 
-    def visit_table_from_clause_node(self, node: SqlTableFromClauseNode) -> SqlQueryPlanNode:  # noqa: D
+    def visit_table_node(self, node: SqlTableNode) -> SqlPlanNode:  # noqa: D102
         return node
 
-    def visit_query_from_clause_node(self, node: SqlSelectQueryFromClauseNode) -> SqlQueryPlanNode:  # noqa: D
+    def visit_query_from_clause_node(self, node: SqlSelectTextNode) -> SqlPlanNode:  # noqa: D102
         return node
 
+    def visit_create_table_as_node(self, node: SqlCreateTableAsNode) -> SqlPlanNode:  # noqa: D102
+        return SqlCreateTableAsNode.create(
+            sql_table=node.sql_table,
+            parent_node=node.parent_node.accept(self),
+        )
 
-class SqlRewritingSubQueryReducer(SqlQueryPlanOptimizer):
+
+class SqlRewritingSubQueryReducer(SqlPlanOptimizer):
     """Simplify queries by eliminating sub-queries when possible by rewriting expressions.
 
      Expressions in the SELECT, GROUP BY, and WHERE are can be rewritten.
@@ -721,10 +870,10 @@ class SqlRewritingSubQueryReducer(SqlQueryPlanOptimizer):
     GROUP BY foo
     """
 
-    def __init__(self, use_column_alias_in_group_bys: bool = False) -> None:  # noqa: D
+    def __init__(self, use_column_alias_in_group_bys: bool = False) -> None:  # noqa: D107
         self._use_column_alias_in_group_bys = use_column_alias_in_group_bys
 
-    def optimize(self, node: SqlQueryPlanNode) -> SqlQueryPlanNode:  # noqa: D
+    def optimize(self, node: SqlPlanNode) -> SqlPlanNode:  # noqa: D102
         result = node.accept(SqlRewritingSubQueryReducerVisitor())
         if self._use_column_alias_in_group_bys:
             return result.accept(SqlGroupByRewritingVisitor())

@@ -108,7 +108,7 @@ celerybeat.pid
 .env
 .venv
 env/
-venv/
+*venv
 ENV/
 env.bak/
 venv.bak/
@@ -134,3 +134,10 @@ dmypy.json
 # IDE
 .idea/
 .vscode/
+
+# Performance reports
+performance-report.json
+performance-comparison.md
+
+# Directory to consolidate files ignored by git.
+**/git_ignored

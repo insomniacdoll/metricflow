@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Tuple, Sequence, List
+from typing import List, Sequence, Tuple
 
-from metricflow.dataset.dataset import DataSet
-from metricflow.protocols.semantics import DataSourceSemanticsAccessor
-from metricflow.specs import (
-    DimensionSpec,
-    TimeDimensionSpec,
-    InstanceSpecSet,
-    PartitionSpecSet,
-)
+from metricflow_semantics.model.semantics.semantic_model_lookup import SemanticModelLookup
+from metricflow_semantics.specs.dimension_spec import DimensionSpec
+from metricflow_semantics.specs.partition_spec_set import PartitionSpecSet
+from metricflow_semantics.specs.spec_set import InstanceSpecSet
+from metricflow_semantics.specs.time_dimension_spec import TimeDimensionSpec
+
+from metricflow.dataset.dataset_classes import DataSet
 
 
 @dataclass(frozen=True)
@@ -33,21 +32,21 @@ class PartitionTimeDimensionJoinDescription:
 class PartitionJoinResolver:
     """When joining data sets, this class helps to figure out the necessary partition specs to join on."""
 
-    def __init__(self, data_source_semantics: DataSourceSemanticsAccessor) -> None:  # noqa: D
-        self._data_source_semantics = data_source_semantics
+    def __init__(self, semantic_model_lookup: SemanticModelLookup) -> None:  # noqa: D107
+        self._semantic_model_lookup = semantic_model_lookup
 
     def _get_partitions(self, spec_set: InstanceSpecSet) -> PartitionSpecSet:
         """Returns the specs from the instance set that correspond to partition specs."""
         partition_dimension_specs = tuple(
-            x
-            for x in spec_set.dimension_specs
-            if self._data_source_semantics.get_dimension(dimension_reference=x.reference).is_partition
+            dimension_spec
+            for dimension_spec in spec_set.dimension_specs
+            if self._semantic_model_lookup.dimension_lookup.get_invariant(dimension_spec.reference).is_partition
         )
         partition_time_dimension_specs = tuple(
-            x
-            for x in spec_set.time_dimension_specs
-            if x.reference != DataSet.metric_time_dimension_reference()
-            and self._data_source_semantics.get_time_dimension(time_dimension_reference=x.reference).is_partition
+            time_dimension_spec
+            for time_dimension_spec in spec_set.time_dimension_specs
+            if time_dimension_spec.reference != DataSet.metric_time_dimension_reference()
+            and self._semantic_model_lookup.dimension_lookup.get_invariant(time_dimension_spec.reference).is_partition
         )
 
         return PartitionSpecSet(
@@ -57,16 +56,16 @@ class PartitionJoinResolver:
 
     @staticmethod
     def _get_simplest_dimension_spec(dimension_specs: Sequence[DimensionSpec]) -> DimensionSpec:
-        """Return the time dimension spec with the fewest identifier links."""
+        """Return the time dimension spec with the fewest entity links."""
         assert len(dimension_specs) > 0
-        sorted_dimension_specs = sorted(dimension_specs, key=lambda x: len(x.identifier_links))
+        sorted_dimension_specs = sorted(dimension_specs, key=lambda x: len(x.entity_links))
         return sorted_dimension_specs[0]
 
     def resolve_partition_dimension_joins(
-        self, start_node_spec_set: InstanceSpecSet, node_to_join_spec_set: InstanceSpecSet
+        self, left_node_spec_set: InstanceSpecSet, node_to_join_spec_set: InstanceSpecSet
     ) -> Tuple[PartitionDimensionJoinDescription, ...]:
         """Figures out which partition dimensions to join on."""
-        start_node_partitions = self._get_partitions(start_node_spec_set)
+        start_node_partitions = self._get_partitions(left_node_spec_set)
         join_node_partitions = self._get_partitions(node_to_join_spec_set)
 
         partition_join_descriptions = []
@@ -97,16 +96,23 @@ class PartitionJoinResolver:
 
     @staticmethod
     def _get_simplest_time_dimension_spec(time_dimension_specs: Sequence[TimeDimensionSpec]) -> TimeDimensionSpec:
-        """Return the time dimension spec with the smallest granularity, then fewest identifier links."""
+        """Return the time dimension spec with the smallest granularity, then fewest entity links."""
         assert len(time_dimension_specs) > 0
-        sorted_specs = sorted(time_dimension_specs, key=lambda x: (x.time_granularity, len(x.identifier_links)))
+        # TODO: [custom granularity] restructure this method to operate on partition collections instead, and
+        # move this enforcement to the PartitionSpecSet
+        assert all(not spec.has_custom_grain for spec in time_dimension_specs), (
+            f"Found custom granularity in partition time dimension specs {time_dimension_specs}, but time partitions "
+            "can only use standard granularities as they are based on engine date/time types!"
+        )
+
+        sorted_specs = sorted(time_dimension_specs, key=lambda x: (x.base_granularity_sort_key, len(x.entity_links)))
         return sorted_specs[0]
 
     def resolve_partition_time_dimension_joins(
-        self, start_node_spec_set: InstanceSpecSet, node_to_join_spec_set: InstanceSpecSet
+        self, left_node_spec_set: InstanceSpecSet, node_to_join_spec_set: InstanceSpecSet
     ) -> Tuple[PartitionTimeDimensionJoinDescription, ...]:
         """Figures out which partition time dimensions to join on."""
-        start_node_partitions = self._get_partitions(start_node_spec_set)
+        start_node_partitions = self._get_partitions(left_node_spec_set)
         join_node_partitions = self._get_partitions(node_to_join_spec_set)
         partition_join_descriptions: List[PartitionTimeDimensionJoinDescription] = []
 
